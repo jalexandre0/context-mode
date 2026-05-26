@@ -151,6 +151,15 @@ async function hookDispatch(platform: string, event: string): Promise<void> {
  * Entry point
  * ------------------------------------------------------- */
 
+// Platforms that use Claude Code's plugin system: marketplace clone,
+// installed_plugins.json registry, .claude-plugin/plugin.json drift heal,
+// .mcp.json sweeping, ~/.claude.json user-MCP heal, skills sync via the
+// installed_plugins.json registry. Pi, codex, gemini-cli, cursor, etc.
+// have none of these artifacts — they get a clean clone → build → copy
+// → deps upgrade. The `!isInProcessPluginPlatform` gate (opencode/kilo)
+// stays on the better-sqlite3 ABI verifier and npm global install: those
+// apply to every out-of-process MCP host, including Pi/codex/gemini/etc.
+const CC_PLUGIN_SYSTEM_PLATFORMS = new Set(["claude-code"]);
 const args = process.argv.slice(2);
 
 function printHelp(): void {
@@ -1059,6 +1068,7 @@ async function upgrade(opts?: { platform?: string }) {
     ? { platform: opts.platform as Parameters<typeof getAdapter>[0], confidence: "high" as const, reason: `--platform ${opts.platform} from ctx_upgrade handler` }
     : detectPlatform();
   const adapter = await getAdapter(detection.platform);
+  const isCC = CC_PLUGIN_SYSTEM_PLATFORMS.has(detection.platform!);
 
   p.intro(color.bgCyan(color.black(" context-mode upgrade ")));
   p.log.info(
@@ -1079,38 +1089,40 @@ async function upgrade(opts?: { platform?: string }) {
   // Issue #460 round-3: route through resolveClaudeConfigDir so users who
   // relocate their CC config root keep the marketplace clone in the same tree.
   const marketplaceDir = resolve(resolveClaudeConfigDir(), "plugins", "marketplaces", "context-mode");
-  if (existsSync(join(marketplaceDir, ".git"))) {
-    s.start("Syncing marketplace clone");
-    try {
-      // Preserve user dev edits (Mert-class users symlink the clone to a worktree).
-      const statusOut = execFileSync(
-        "git", ["-C", marketplaceDir, "status", "--porcelain"],
-        { stdio: "pipe", encoding: "utf-8", timeout: 5000 },
-      );
-      if (statusOut.trim()) {
-        s.stop(color.yellow("Marketplace clone has local edits — skipping git pull"));
-        p.log.info(
-          color.dim(`  Run manually: git -C "${marketplaceDir}" stash && git pull --ff-only`),
+  if (isCC) {
+    if (existsSync(join(marketplaceDir, ".git"))) {
+      s.start("Syncing marketplace clone");
+      try {
+        // Preserve user dev edits (Mert-class users symlink the clone to a worktree).
+        const statusOut = execFileSync(
+          "git", ["-C", marketplaceDir, "status", "--porcelain"],
+          { stdio: "pipe", encoding: "utf-8", timeout: 5000 },
         );
-      } else {
-        execFileSync(
-          "git", ["-C", marketplaceDir, "fetch", "--tags", "origin"],
-          { stdio: "pipe", timeout: 30000 },
-        );
-        execFileSync(
-          "git", ["-C", marketplaceDir, "reset", "--hard", "origin/HEAD"],
-          { stdio: "pipe", timeout: 10000 },
-        );
-        s.stop(color.green("Marketplace clone synced"));
-        changes.push("Marketplace clone updated to upstream");
+        if (statusOut.trim()) {
+          s.stop(color.yellow("Marketplace clone has local edits — skipping git pull"));
+          p.log.info(
+            color.dim(`  Run manually: git -C "${marketplaceDir}" stash && git pull --ff-only`),
+          );
+        } else {
+          execFileSync(
+            "git", ["-C", marketplaceDir, "fetch", "--tags", "origin"],
+            { stdio: "pipe", timeout: 30000 },
+          );
+          execFileSync(
+            "git", ["-C", marketplaceDir, "reset", "--hard", "origin/HEAD"],
+            { stdio: "pipe", timeout: 10000 },
+          );
+          s.stop(color.green("Marketplace clone synced"));
+          changes.push("Marketplace clone updated to upstream");
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        s.stop(color.yellow("Marketplace sync skipped"));
+        p.log.warn(color.yellow("git refresh on marketplace failed") + ` — ${message}`);
+        p.log.info(color.dim("  Continuing — cache dir update will still happen."));
       }
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      s.stop(color.yellow("Marketplace sync skipped"));
-      p.log.warn(color.yellow("git refresh on marketplace failed") + ` — ${message}`);
-      p.log.info(color.dim("  Continuing — cache dir update will still happen."));
     }
-  }
+  } // CC_PLUGIN_SYSTEM_PLATFORMS
 
   // Step 1: Pull latest from GitHub
   p.log.step("Pulling latest from GitHub...");
@@ -1254,147 +1266,149 @@ async function upgrade(opts?: { platform?: string }) {
       // the old version (rsync race, partial write, files-array drift),
       // updating the registry would create the silent v1.0.113-class
       // drift Mert hit. Bail out — the next /ctx-upgrade gets to retry.
-      const pluginManifest = resolve(pluginRoot, ".claude-plugin", "plugin.json");
-      let onDiskVersion: string | null = null;
-      try {
-        const pj = JSON.parse(readFileSync(pluginManifest, "utf-8"));
-        if (pj && typeof pj.version === "string") onDiskVersion = pj.version;
-      } catch { /* parse error → onDiskVersion stays null */ }
-      if (onDiskVersion !== newVersion) {
-        throw new Error(
-          `pluginRoot manifest version mismatch — disk says "${onDiskVersion ?? "<missing>"}" but newVersion is "${newVersion}". Refusing to bump registry.`,
-        );
-      }
+      if (isCC) {
+        const pluginManifest = resolve(pluginRoot, ".claude-plugin", "plugin.json");
+        let onDiskVersion: string | null = null;
+        try {
+          const pj = JSON.parse(readFileSync(pluginManifest, "utf-8"));
+          if (pj && typeof pj.version === "string") onDiskVersion = pj.version;
+        } catch { /* parse error → onDiskVersion stays null */ }
+        if (onDiskVersion !== newVersion) {
+          throw new Error(
+            `pluginRoot manifest version mismatch — disk says "${onDiskVersion ?? "<missing>"}" but newVersion is "${newVersion}". Refusing to bump registry.`,
+          );
+        }
 
-      // Fix registry — adapter-aware
-      adapter.updatePluginRegistry(pluginRoot, newVersion);
-      p.log.info(color.dim("  Registry synced to " + pluginRoot));
+        // Fix registry — adapter-aware
+        adapter.updatePluginRegistry(pluginRoot, newVersion);
+        p.log.info(color.dim("  Registry synced to " + pluginRoot));
 
-      // v1.0.114 hotfix — post-write assertion: re-read installed_plugins.json
-      // and verify installPath/.claude-plugin/plugin.json's version matches
-      // the registry entry. Throws on mismatch — fails loudly so a future
-      // adapter regression surfaces here, not weeks later in user reports.
-      try {
-        const ipPath = resolve(resolveClaudeConfigDir(), "plugins", "installed_plugins.json");
-        if (existsSync(ipPath)) {
-          const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
-          const entries = ip?.plugins?.["context-mode@context-mode"];
-          if (Array.isArray(entries)) {
-            for (const entry of entries) {
-              const ip2 = entry?.installPath;
-              if (typeof ip2 !== "string" || !ip2) continue;
-              if (!existsSync(ip2)) {
-                throw new Error(`installPath does not exist on disk: ${ip2}`);
-              }
-              const pjPath = resolve(ip2, ".claude-plugin", "plugin.json");
-              if (!existsSync(pjPath)) {
-                throw new Error(`missing plugin.json manifest at ${pjPath}`);
-              }
-              const pj = JSON.parse(readFileSync(pjPath, "utf-8"));
-              if (pj?.version !== entry.version) {
-                throw new Error(
-                  `version mismatch — registry says "${entry.version}" but ${pjPath} says "${pj?.version}"`,
-                );
+        // v1.0.114 hotfix — post-write assertion: re-read installed_plugins.json
+        // and verify installPath/.claude-plugin/plugin.json's version matches
+        // the registry entry. Throws on mismatch — fails loudly so a future
+        // adapter regression surfaces here, not weeks later in user reports.
+        try {
+          const ipPath = resolve(resolveClaudeConfigDir(), "plugins", "installed_plugins.json");
+          if (existsSync(ipPath)) {
+            const ip = JSON.parse(readFileSync(ipPath, "utf-8"));
+            const entries = ip?.plugins?.["context-mode@context-mode"];
+            if (Array.isArray(entries)) {
+              for (const entry of entries) {
+                const ip2 = entry?.installPath;
+                if (typeof ip2 !== "string" || !ip2) continue;
+                if (!existsSync(ip2)) {
+                  throw new Error(`installPath does not exist on disk: ${ip2}`);
+                }
+                const pjPath = resolve(ip2, ".claude-plugin", "plugin.json");
+                if (!existsSync(pjPath)) {
+                  throw new Error(`missing plugin.json manifest at ${pjPath}`);
+                }
+                const pj = JSON.parse(readFileSync(pjPath, "utf-8"));
+                if (pj?.version !== entry.version) {
+                  throw new Error(
+                    `version mismatch — registry says "${entry.version}" but ${pjPath} says "${pj?.version}"`,
+                  );
+                }
               }
             }
           }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new Error(`Registry consistency check failed: ${message}`);
         }
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`Registry consistency check failed: ${message}`);
-      }
 
-      // v1.0.119 — Issue #523 — Layer 5 heal: assert .claude-plugin/plugin.json's
-      // mcpServers["context-mode"].args[0] is the literal ${CLAUDE_PLUGIN_ROOT}/start.mjs
-      // placeholder, not a tmpdir-prefixed absolute path. cli.ts already wrote .mcp.json
-      // with the placeholder (#411 fix), but plugin.json was never touched here — and
-      // start.mjs's normalize-hooks (Windows + #378) can bake in absolute paths that
-      // become stale across upgrades. We call the shared heal twice: first call cleans
-      // any drift; second call MUST return healed:[] or we throw. Single source of
-      // truth shared with start.mjs HEAL block + postinstall.
-      try {
-        const pluginCacheRoot = resolve(resolveClaudeConfigDir(), "plugins", "cache");
-        const pluginKey = "context-mode@context-mode";
-        const firstPass = healPluginJsonMcpServers({ pluginRoot, pluginCacheRoot, pluginKey });
-        if (firstPass && firstPass.error) {
-          throw new Error(firstPass.error);
-        }
-        const secondPass = healPluginJsonMcpServers({ pluginRoot, pluginCacheRoot, pluginKey });
-        if (secondPass && Array.isArray(secondPass.healed) && secondPass.healed.length > 0) {
-          throw new Error(
-            `Plugin manifest drift: plugin.json mcpServers.args still poisoned after first heal pass (healed=${secondPass.healed.join(",")})`,
-          );
-        }
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`plugin.json drift check failed: ${message}`);
-      }
-
-      // Issue #609 — Layer 6 replacement: sweep stale `.mcp.json` files from
-      // every per-version cache dir. Supersedes the previous healMcpJsonArgs
-      // drift-check block (v1.0.122) — that block existed because cli.ts
-      // itself wrote `.mcp.json`. With the write gone (above), the only
-      // remaining `.mcp.json` files are stale carry-forwards from earlier
-      // versions. Sweep them so Claude Code's auto-update can't replay them
-      // into a fresh version dir.
-      //
-      // Belt-and-braces: a second sweep call MUST report removed:[] or we
-      // throw — same architectural-lock pattern as the plugin.json drift
-      // check above. Single source of truth shared with start.mjs HEAL
-      // block + postinstall.
-      try {
-        const pluginCacheRoot = resolve(resolveClaudeConfigDir(), "plugins", "cache");
-        const pluginKey = "context-mode@context-mode";
-        const firstSweep = sweepStaleMcpJson({ pluginCacheRoot, pluginKey });
-        if (firstSweep && firstSweep.removed && firstSweep.removed.length > 0) {
-          p.log.info(color.dim(`  Swept ${firstSweep.removed.length} stale .mcp.json file(s) from cache`));
-        }
-        const secondSweep = sweepStaleMcpJson({ pluginCacheRoot, pluginKey });
-        if (secondSweep && Array.isArray(secondSweep.removed) && secondSweep.removed.length > 0) {
-          throw new Error(
-            `.mcp.json sweep drift: ${secondSweep.removed.length} file(s) still present after first pass`,
-          );
-        }
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        throw new Error(`.mcp.json sweep check failed: ${message}`);
-      }
-
-      // v1.0.X — Layer 7 heal: update user-level ~/.claude.json MCP server
-      // registrations that point to old context-mode version dirs.
-      // (anthropics/claude-code#59310 workaround — see heal-installed-plugins.mjs)
-      try {
-        // @ts-expect-error — JS module, no TS declarations
-        const { healClaudeJsonMcpArgs } = await import("../scripts/heal-installed-plugins.mjs");
-        const dotClaudeJson = resolve(homedir(), ".claude.json");
-        const pluginCacheParent = resolve(resolveClaudeConfigDir(), "plugins", "cache", "context-mode", "context-mode");
-        const result = healClaudeJsonMcpArgs({ dotClaudeJsonPath: dotClaudeJson, pluginCacheParent, newPluginRoot: pluginRoot });
-        if (result.healed && result.healed.length > 0) {
-          p.log.info(color.dim("  ~/.claude.json user MCP registrations updated → " + newVersion));
-        }
-      } catch {
-        /* best effort — never block upgrade */
-      }
-
-      // v1.0.114 hotfix — marketplace post-pull assertion: clone (if
-      // present) MUST be on newVersion. Mert's case showed marketplace
-      // stuck at v1.0.89 — the sync block above swallowed that silently.
-      // Warn (don't throw) — npm-only users have no marketplace clone.
-      try {
-        const marketplaceManifest = resolve(marketplaceDir, ".claude-plugin", "plugin.json");
-        if (existsSync(marketplaceManifest)) {
-          const mpj = JSON.parse(readFileSync(marketplaceManifest, "utf-8"));
-          if (mpj?.version !== newVersion) {
-            p.log.warn(
-              color.yellow("Marketplace clone version mismatch") +
-                ` — ${marketplaceDir} reports "${mpj?.version}" but expected "${newVersion}"`,
-            );
-            p.log.info(
-              color.dim(`  Run manually: git -C "${marketplaceDir}" fetch --tags origin && git -C "${marketplaceDir}" reset --hard origin/HEAD`),
+        // v1.0.119 — Issue #523 — Layer 5 heal: assert .claude-plugin/plugin.json's
+        // mcpServers["context-mode"].args[0] is the literal ${CLAUDE_PLUGIN_ROOT}/start.mjs
+        // placeholder, not a tmpdir-prefixed absolute path. cli.ts already wrote .mcp.json
+        // with the placeholder (#411 fix), but plugin.json was never touched here — and
+        // start.mjs's normalize-hooks (Windows + #378) can bake in absolute paths that
+        // become stale across upgrades. We call the shared heal twice: first call cleans
+        // any drift; second call MUST return healed:[] or we throw. Single source of
+        // truth shared with start.mjs HEAL block + postinstall.
+        try {
+          const pluginCacheRoot = resolve(resolveClaudeConfigDir(), "plugins", "cache");
+          const pluginKey = "context-mode@context-mode";
+          const firstPass = healPluginJsonMcpServers({ pluginRoot, pluginCacheRoot, pluginKey });
+          if (firstPass && firstPass.error) {
+            throw new Error(firstPass.error);
+          }
+          const secondPass = healPluginJsonMcpServers({ pluginRoot, pluginCacheRoot, pluginKey });
+          if (secondPass && Array.isArray(secondPass.healed) && secondPass.healed.length > 0) {
+            throw new Error(
+              `Plugin manifest drift: plugin.json mcpServers.args still poisoned after first heal pass (healed=${secondPass.healed.join(",")})`,
             );
           }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new Error(`plugin.json drift check failed: ${message}`);
         }
-      } catch { /* best effort */ }
+
+        // Issue #609 — Layer 6 replacement: sweep stale `.mcp.json` files from
+        // every per-version cache dir. Supersedes the previous healMcpJsonArgs
+        // drift-check block (v1.0.122) — that block existed because cli.ts
+        // itself wrote `.mcp.json`. With the write gone (above), the only
+        // remaining `.mcp.json` files are stale carry-forwards from earlier
+        // versions. Sweep them so Claude Code's auto-update can't replay them
+        // into a fresh version dir.
+        //
+        // Belt-and-braces: a second sweep call MUST report removed:[] or we
+        // throw — same architectural-lock pattern as the plugin.json drift
+        // check above. Single source of truth shared with start.mjs HEAL
+        // block + postinstall.
+        try {
+          const pluginCacheRoot = resolve(resolveClaudeConfigDir(), "plugins", "cache");
+          const pluginKey = "context-mode@context-mode";
+          const firstSweep = sweepStaleMcpJson({ pluginCacheRoot, pluginKey });
+          if (firstSweep && firstSweep.removed && firstSweep.removed.length > 0) {
+            p.log.info(color.dim(`  Swept ${firstSweep.removed.length} stale .mcp.json file(s) from cache`));
+          }
+          const secondSweep = sweepStaleMcpJson({ pluginCacheRoot, pluginKey });
+          if (secondSweep && Array.isArray(secondSweep.removed) && secondSweep.removed.length > 0) {
+            throw new Error(
+              `.mcp.json sweep drift: ${secondSweep.removed.length} file(s) still present after first pass`,
+            );
+          }
+        } catch (err: unknown) {
+          const message = err instanceof Error ? err.message : String(err);
+          throw new Error(`.mcp.json sweep check failed: ${message}`);
+        }
+
+        // v1.0.X — Layer 7 heal: update user-level ~/.claude.json MCP server
+        // registrations that point to old context-mode version dirs.
+        // (anthropics/claude-code#59310 workaround — see heal-installed-plugins.mjs)
+        try {
+          // @ts-expect-error — JS module, no TS declarations
+          const { healClaudeJsonMcpArgs } = await import("../scripts/heal-installed-plugins.mjs");
+          const dotClaudeJson = resolve(homedir(), ".claude.json");
+          const pluginCacheParent = resolve(resolveClaudeConfigDir(), "plugins", "cache", "context-mode", "context-mode");
+          const result = healClaudeJsonMcpArgs({ dotClaudeJsonPath: dotClaudeJson, pluginCacheParent, newPluginRoot: pluginRoot });
+          if (result.healed && result.healed.length > 0) {
+            p.log.info(color.dim("  ~/.claude.json user MCP registrations updated → " + newVersion));
+          }
+        } catch {
+          /* best effort — never block upgrade */
+        }
+
+        // v1.0.114 hotfix — marketplace post-pull assertion: clone (if
+        // present) MUST be on newVersion. Mert's case showed marketplace
+        // stuck at v1.0.89 — the sync block above swallowed that silently.
+        // Warn (don't throw) — npm-only users have no marketplace clone.
+        try {
+          const marketplaceManifest = resolve(marketplaceDir, ".claude-plugin", "plugin.json");
+          if (existsSync(marketplaceManifest)) {
+            const mpj = JSON.parse(readFileSync(marketplaceManifest, "utf-8"));
+            if (mpj?.version !== newVersion) {
+              p.log.warn(
+                color.yellow("Marketplace clone version mismatch") +
+                  ` — ${marketplaceDir} reports "${mpj?.version}" but expected "${newVersion}"`,
+              );
+              p.log.info(
+                color.dim(`  Run manually: git -C "${marketplaceDir}" fetch --tags origin && git -C "${marketplaceDir}" reset --hard origin/HEAD`),
+              );
+            }
+          }
+        } catch { /* best effort */ }
+      } // CC_PLUGIN_SYSTEM_PLATFORMS
 
       // Install production deps
       s.start("Installing production dependencies");
@@ -1405,7 +1419,7 @@ async function upgrade(opts?: { platform?: string }) {
       });
       s.stop("Dependencies ready");
 
-      if (!isInProcessPluginPlatform(detection.platform)) {
+      if (isCC) {
         // Verify native addons through the same bootstrap start.mjs imports.
         // On modern Node, the ABI-specific cache file is the compatibility marker;
         // the active binding alone may be stale from a previous Node ABI.
@@ -1510,25 +1524,27 @@ async function upgrade(opts?: { platform?: string }) {
       // Only targets the ACTUAL directory Claude Code reads from — not spraying everywhere.
       // Issue #460 round-3: honor $CLAUDE_CONFIG_DIR so the registry lookup
       // tracks relocated CC config trees.
-      try {
-        const registryPath = resolve(resolveClaudeConfigDir(), "plugins", "installed_plugins.json");
-        if (existsSync(registryPath)) {
-          const registry = JSON.parse(readFileSync(registryPath, "utf-8"));
-          const entries = registry?.plugins?.["context-mode@context-mode"];
-          if (Array.isArray(entries)) {
-            for (const entry of entries) {
-              const installPath = entry.installPath;
-              if (installPath && installPath !== pluginRoot && existsSync(installPath)) {
-                const srcSkills = resolve(srcDir, "skills");
-                if (existsSync(srcSkills)) {
-                  cpSync(srcSkills, resolve(installPath, "skills"), { recursive: true });
-                  changes.push(`Synced skills to active install path`);
+      if (isCC) {
+        try {
+          const registryPath = resolve(resolveClaudeConfigDir(), "plugins", "installed_plugins.json");
+          if (existsSync(registryPath)) {
+            const registry = JSON.parse(readFileSync(registryPath, "utf-8"));
+            const entries = registry?.plugins?.["context-mode@context-mode"];
+            if (Array.isArray(entries)) {
+              for (const entry of entries) {
+                const installPath = entry.installPath;
+                if (installPath && installPath !== pluginRoot && existsSync(installPath)) {
+                  const srcSkills = resolve(srcDir, "skills");
+                  if (existsSync(srcSkills)) {
+                    cpSync(srcSkills, resolve(installPath, "skills"), { recursive: true });
+                    changes.push(`Synced skills to active install path`);
+                  }
                 }
               }
             }
           }
-        }
-      } catch { /* best effort — registry may not exist or be malformed */ }
+        } catch { /* best effort — registry may not exist or be malformed */ }
+      } // CC_PLUGIN_SYSTEM_PLATFORMS
 
       changes.push(`Updated v${localVersion} → v${newVersion}`);
       p.log.success(
