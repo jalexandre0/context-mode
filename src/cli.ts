@@ -1419,7 +1419,18 @@ async function upgrade(opts?: { platform?: string }) {
       });
       s.stop("Dependencies ready");
 
-      if (isCC) {
+      // ABI verifier, binding self-heal, and npm-global update are gated by
+      // !isInProcessPluginPlatform, NOT by isCC. opencode/kilo ship MCP
+      // in-process so they have no separate npm binary to update and ride
+      // the host's better-sqlite3 — they skip. Every other adapter (codex,
+      // gemini-cli, cursor, kiro, pi, omp, zed, vscode-copilot,
+      // jetbrains-copilot, antigravity, qwen-code) runs the MCP server
+      // out-of-process and DOES need its better-sqlite3 binding healed
+      // after npm install — see 5b6ef81 (#514): silent ABI breakage left
+      // /ctx-upgrade reporting success while the knowledge base was
+      // unusable on every non-CC adapter. The isCC gate would re-open
+      // that exact regression class on 11 of 14 adapters.
+      if (!isInProcessPluginPlatform(detection.platform)) {
         // Verify native addons through the same bootstrap start.mjs imports.
         // On modern Node, the ABI-specific cache file is the compatibility marker;
         // the active binding alone may be stale from a previous Node ABI.
